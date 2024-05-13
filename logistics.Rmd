@@ -1,0 +1,274 @@
+---
+title: "Bayesian Modeling"
+author: "Xiyu Li, Xiaoya Huang"
+date: "2024-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(ggplot2)
+flight_data <- read_csv("flightData_merged.csv")
+```
+
+# Data Cleaning
+
+```{r}
+# Select flights that are delayed only caused by weather and NAS
+WNN <- flight_data %>% 
+  filter(!WeatherDelay == 0) %>% 
+  filter(!NASDelay == 0) %>% 
+  filter(CarrierDelay == 0) %>% 
+  filter(LateAircraftDelay == 0) %>% 
+  filter(SecurityDelay == 0)
+```
+
+
+```{r}
+# Randomly select 252 flights from ontime flights
+d <- flight_data %>% 
+  filter(DepDel15 == 0)
+
+nn <- nrow(d)
+indi <- sample(1:nn)
+
+size <- nrow(WNN)
+
+NDdata <- d[indi[1:size],]
+
+b_data <- rbind(NDdata, WNN)
+
+baye_data <- b_data %>% 
+  select(DepDel15, Origin, snowdepth, icon, volume) %>% 
+  mutate(OriginLAX = ifelse(Origin == "LAX", 1, 0),
+         OriginLAS = ifelse(Origin == "LAS", 1, 0), 
+         #iconcloudly = ifelse(icon == "cloudly", 1,0),
+         iconrain = ifelse(icon == "rain", 1, 0),
+         #iconwin = ifelse(icon == "wind", 1, 0),
+         iconsnow = ifelse(icon == "snow", 1, 0))
+```
+
+
+# Exploratory Data Analysis
+```{r}
+library(ggthemes)
+head(baye_data)
+baye_data %>% ggplot(aes(x = icon, fill = as.factor(DepDel15))) + geom_histogram(stat="count") + labs(x = "", y = "count of flights", title = "Flight Delay over different Weather Conditions", fill = "Delay") + theme_light()
+
+baye_data %>% ggplot(aes(x = Origin, fill = as.factor(DepDel15))) + geom_histogram(stat="count") + labs(x = "", y = "count of flights", title = "Flight Delay over different Origin Airport", fill = "Delay") + theme_light()
+```
+
+# Frequentist Approach
+```{r}
+# Set the seed for reproducibility
+set.seed(123)
+
+# Generate a vector of row indices
+n <- nrow(b_data)
+indices <- sample(1:n)
+
+# Determine the size of the training set (e.g., 80%)
+tr_size <- round(0.8 * n)
+
+# Select rows for training and testing
+tr_data <- b_data[indices[1:tr_size], ]
+te_data <- b_data[indices[(tr_size + 1):n], ]
+
+
+model_2 <- glm(DepDel15 ~ volume + Origin + snowdepth + icon, data = tr_data, family = binomial(link = "logit"))
+
+summary(model_2)
+
+pred = predict(model_2, newdata = te_data)
+predb = ifelse(pred > 0.5, 1, 0)
+
+te_data %>% 
+  mutate(pred = predict(model_2, newdata = te_data)) %>% 
+  mutate(predb = ifelse(pred > 0.5, 1, 0)) %>% 
+  count(predb, DepDel15)
+
+# prediction accuracy
+print(paste0("Accuracy: ", round(mean(predb==te_data$DepDel15),3)))
+print(paste0("Cor(predict, Actual):", round(cor(te_data$DepDel15, predb),3)))
+```
+
+# Bayesian Approach
+
+```{r}
+baye_data <- b_data %>% 
+  select(DepDel15, Origin, snowdepth, icon, volume) %>% 
+  mutate(OriginLAX = ifelse(Origin == "LAX", 1, 0),
+         OriginLAS = ifelse(Origin == "LAS", 1, 0), 
+         #iconcloudly = ifelse(icon == "cloudly", 1,0),
+         iconrain = ifelse(icon == "rain", 1, 0),
+         #iconwin = ifelse(icon == "wind", 1, 0),
+         iconsnow = ifelse(icon == "snow", 1, 0)) %>% 
+  mutate(intercept = 1) %>% 
+  select(-Origin, -icon)
+
+index <- sample(1:nrow(baye_data), size = round(0.7 * nrow(baye_data)), replace = FALSE)
+
+train_data <-baye_data[index, ]
+test_data <- baye_data[-index, ]
+
+x1 = as.matrix(train_data[-1])
+test_X = as.matrix(test_data[-1])
+
+y = as.matrix(train_data[1])
+test_y = as.matrix(test_data[1])
+```
+
+## Using rstanarm package
+```{r}
+library(rstanarm)
+delay_prob <- mean(baye_data$DepDel15)
+intercept <- log(delay_prob/(1-delay_prob))
+
+
+model <- stan_glm(DepDel15 ~1+., data = train_data, family = binomial,
+                  seed = 123,
+                  prior_intercept = normal(intercept, abs(intercept/2)), prior = normal(0, 2.5), 
+                  chains = 4, iter = 500, refresh = 0)
+
+summary(model)
+
+```
+
+```{r}
+acf_result <- acf(model)
+```
+
+
+```{r}
+test_predictions <- predict(model, newdata = test_data)
+
+posterior <- posterior_predict(model, newdata = test_data)
+predicted_classes <- ifelse(test_predictions > 0.5, 1, 0)
+
+mean(predicted_classes==test_y)
+
+cor(predicted_classes, test_y)
+
+```
+
+## Handcode
+
+```{r}
+index <- sample(1:nrow(baye_data), size = round(0.7 * nrow(baye_data)), replace = FALSE)
+
+train_data <-baye_data[index, ]
+test_data <- baye_data[-index, ]
+
+X = as.matrix(train_data[-1])
+test_X = as.matrix(test_data[-1])
+
+y = as.matrix(train_data[1])
+test_y = as.matrix(test_data[1])
+
+# use predicted coefficients from frequentist logistic regression model as prior information
+betas <- coefficients(model_2)
+
+betaa <- c(betas[5], betas[2], betas[4], betas[3],betas[8],betas[9],betas[1])
+```
+
+```{r}
+library(MASS)
+
+set.seed(1234)
+S <- 10000
+
+# Log-posterior distribution
+logpost <- function(X,Y,beta){
+  eta <- as.numeric(as.matrix(X)%*% beta)
+  logp<- eta - log(1+exp(eta))
+#Logp <- ifelse(eta<0,eta -log(1+exp(eta))，-log(1+exp(-eta)))
+  logq <- log(1-exp(logp))
+#logq <- ifelse(eta<8, log(1-exp(logp)),- eta - log1p(exp(- eta)))
+  log1 <- sum(logp[Y==1])+ sum(logq[Y==0])
+  lprior <- sum(dnorm(beta, 0, 100, log = T))
+  return(log1 + lprior)
+}
+
+simulation <- function(S, init, x1, y, c=0.5){
+  # Initialize arrays to store sampled coefficients, acceptance rate, etc.
+  beta0 <- matrix(NA, nrow=S,ncol=ncol(x1))
+  beta0[1,]<- as.numeric(init)
+  y_new <- c()
+  accept <- 0
+  
+  # precision matrix
+  omega <- solve(t(x1)%*%as.matrix(x1))
+  
+  for(i in 2:S){
+    beta1 <- mvrnorm(1,beta0[i-1,],c*omega)
+    # log-posterior for proposed and current coefficients
+    new <- logpost(x1,y,beta1)
+    old <- logpost(x1,y,matrix(beta0[i-1,],ncol=1))
+    
+    if(runif(1,0,1)>exp(new-old)){
+      beta0[i,] <- beta0[i-1,]
+      }
+    else{
+      beta0[i,]=beta1
+      accept <- accept+1
+      }
+    if(i%%1000==0){
+    print(c(i,accept/i))
+    }
+  }
+  return(beta0)
+}
+init0 <- as.numeric(betaa)
+
+res0 <- simulation(S, init0, X, y, 5)
+```
+
+```{r}
+# Calculate column mean
+column_mean <- apply(res0, 2, mean)
+
+# Calculate column standard deviation
+column_sd <- apply(res0, 2, sd)
+
+# Calculate percentiles (10th, 50th, and 90th)
+percentiles <- apply(res0, 2, quantile, probs = c(0.1, 0.5, 0.9))
+
+
+options(digits = 3)
+# Create a dataframe with results
+results <- data.frame(
+  Column = names(betaa),
+  Mean = column_mean,
+  SD = column_sd,
+  `10%` = percentiles[1, ],
+  `50%` = percentiles[2, ],
+  `90%` = percentiles[3, ]
+)
+
+results
+
+```
+
+```{r}
+# Predict over test data using mean of betas
+aa <- exp(-test_X %*% as.matrix(colMeans(res0)))
+pred <- 1/(1+aa)
+predb <- ifelse(pred > 0.5, 1, 0)
+
+mean(predb == test_y)
+cor(predb,test_y)
+```
+
+```{r}
+library(coda)
+
+mcmc <- as.mcmc(res0)
+effectiveSize(mcmc)
+```
+
